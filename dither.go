@@ -6,6 +6,8 @@ import (
 	"image/draw"
 	"math"
 	"runtime"
+
+	"github.com/lucasb-eyer/go-colorful"
 )
 
 // copyPalette deeply copies colors and returns a new slice that is unrelated.
@@ -17,6 +19,50 @@ func copyPalette(p []color.Color) []color.Color {
 		ret[i] = color.RGBA64{uint16(r), uint16(g), uint16(b), uint16(a)}
 	}
 	return ret
+}
+
+// Uses the CIE94 formula to calculate color distance. More accurate than
+// DistanceLab, but also more work.
+//
+// Taken from go-colorful, changed the weights to CIE94 "Textiles"
+func DistanceCIE94Textiles(cl, cr colorful.Color) float64 {
+	// Square function shortcut
+	sq := func (v float64) float64 {
+		return v * v
+	}
+
+	l1, a1, b1 := cl.Lab()
+	l2, a2, b2 := cr.Lab()
+
+	// NOTE: Since all those formulas expect L,a,b values 100x larger than we
+	//       have them in this library, we either need to adjust all constants
+	//       in the formula, or convert the ranges of L,a,b before, and then
+	//       scale the distances down again. The latter is less error-prone.
+	l1, a1, b1 = l1*100.0, a1*100.0, b1*100.0
+	l2, a2, b2 = l2*100.0, a2*100.0, b2*100.0
+
+	kl := 2.0 // 2.0 for textiles
+	kc := 1.0
+	kh := 1.0
+	k1 := 0.048 // 0.048 for textiles
+	k2 := 0.014 // 0.014 for textiles.
+
+	deltaL := l1 - l2
+	c1 := math.Sqrt(sq(a1) + sq(b1))
+	c2 := math.Sqrt(sq(a2) + sq(b2))
+	deltaCab := c1 - c2
+
+	// Not taking Sqrt here for stability, and it's unnecessary.
+	deltaHab2 := sq(a1-a2) + sq(b1-b2) - sq(deltaCab)
+	sl := 1.0
+	sc := 1.0 + k1*c1
+	sh := 1.0 + k2*c1
+
+	vL2 := sq(deltaL / (kl * sl))
+	vC2 := sq(deltaCab / (kc * sc))
+	vH2 := deltaHab2 / sq(kh*sh)
+
+	return math.Sqrt(vL2+vC2+vH2) * 0.01 // See above.
 }
 
 // Ditherer dithers images according to the settings in the struct.
@@ -67,6 +113,9 @@ type Ditherer struct {
 	// color.RGBA64.
 	palette []color.Color
 
+	// holds all the palette colors, but using Color class of go-colorful
+	colorfulPalette []colorful.Color
+
 	// linearPalette holds all the palette colors, but in linear RGB space.
 	linearPalette [][3]uint16
 }
@@ -83,6 +132,12 @@ func NewDitherer(palette []color.Color) *Ditherer {
 
 	// Palette is copied so the user can't modify it externally later
 	d.palette = copyPalette(palette)
+	d.colorfulPalette = make([]colorful.Color, len(d.palette))
+
+	// create a colorful.Color copy of the palette
+	for i, c := range d.palette {
+		d.colorfulPalette[i], _ = colorful.MakeColor(c)
+	}
 
 	// Create linear RGB version of the palette
 	d.linearPalette = make([][3]uint16, len(d.palette))
@@ -117,32 +172,32 @@ func (d *Ditherer) GetPalette() []color.Color {
 	return copyPalette(d.palette)
 }
 
-func sqDiff(v1 uint16, v2 uint16) uint32 {
-	// This optimization is copied from Go stdlib, see
-	// https://github.com/golang/go/blob/go1.15.7/src/image/color/color.go#L314
-
-	d := uint32(v1) - uint32(v2)
-	return (d * d) >> 2
-}
-
 // closestColor returns the index of the color in the palette that's closest to
-// the provided one, using Euclidean distance in linear RGB space. The provided
+// the provided one, using CIE94 formula with "Textiles" weights to calculate distance. The provided
 // RGB values must be linear RGB.
 func (d *Ditherer) closestColor(r, g, b uint16) int {
-	// Go through each color and find the closest one
-	color, best := 0, uint32(math.MaxUint32)
-	for i, c := range d.linearPalette {
-		// Euclidean distance, but the square root part is removed
-		dist := sqDiff(r, c[0]) + sqDiff(g, c[1]) + sqDiff(b, c[2])
+	convVal := func (v uint16) float64 {
+		return float64(v) / float64(math.MaxUint16)
+	}
+
+	// construct color of the original pixel (in lin RGB)
+	realColor := colorful.LinearRgb(convVal(r), convVal(g), convVal(b))
+	paletteIdx, best := 0, math.Inf(1)
+
+	for i, c := range d.colorfulPalette {
+		dist := DistanceCIE94Textiles(realColor, c)
 
 		if dist < best {
-			if dist == 0 {
+			// same enough, return index
+			if dist < 0.0005 {
 				return i
 			}
-			color, best = i, dist
+
+			paletteIdx, best = i, dist
 		}
 	}
-	return color
+
+	return paletteIdx
 }
 
 // unpremultAndLinearize unpremultiplies the provided color, and returns the
